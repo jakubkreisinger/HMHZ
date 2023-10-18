@@ -1,0 +1,2044 @@
+---
+title: "Gut bacteriome analyses"
+author: "Jakub Kreisinger"
+date: "September 5, 2023"
+output: html_document
+---
+
+# Packages and custom functions
+
+```{r setup}
+library(dada2)
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(plyr)
+library(spaMM)
+library(glmmTMB)
+library(doSNOW)
+library(DHARMa)
+library(ggpubr)
+library(microbiome)
+library(spaMM)
+library(ape)
+library(MDMR)
+library(LDM)
+library(Hmsc)
+library(car)
+library(glmmTMB)
+library(magrittr)
+library(dplyr)
+
+c25 <- c("dodgerblue2","#E31A1C", # red
+         "green4",
+         "#6A3D9A", # purple
+         "#FF7F00", # orange
+         "black","gold1",
+         "skyblue2","#FB9A99", # lt pink
+         "palegreen2",
+         "#CAB2D6", # lt purple
+         "#FDBF6F", # lt orange
+         "gray70", "khaki2",
+         "maroon","orchid1","deeppink1","blue1","steelblue4",
+         "darkturquoise","green1","yellow4","yellow3",
+         "darkorange4","brown")
+
+manage_unassigned<-function(PHYLOSEQ,UNASS_STRING=NA,ADD,AFTER=TRUE){
+   TAXall<-data.frame(tax_table(PHYLOSEQ),stringsAsFactors = F)
+   if(!is.na(UNASS_STRING)){TAXall[UNASS_STRING]<-NA}
+   # TAXall<-as.character(TAXall[i,])
+   for(i in 1:dim(TAXall)[1]){  
+       TAX<-as.character(TAXall[i,])
+       if(AFTER==TRUE) {for(j in 2: length(TAX)){
+                            if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                           TAX[j-1],paste(TAX[j-1],ADD,sep=""))}}}
+      if(AFTER==FALSE) {for(j in 2: length(TAX)){
+                            if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                     TAX[j-1],ADD,paste(TAX[j-1],sep=""))}}}
+      TAXall[i,]<-TAX
+    }
+   TAXA<-colnames(TAXall)
+   SPECIES<-rownames(TAXall)
+   TAXall<-tax_table(TAXall)
+   taxa_names(TAXall)<-SPECIES
+   colnames(TAXall)<-TAXA
+   tax_table(PHYLOSEQ)<-TAXall
+  
+   #output
+   PHYLOSEQ
+}
+
+
+
+phyloseq_2_GG<-function(which.taxa,which.phyloseq,manage.ussigned=NULL,unassign.string=NULL){  
+  RESULT<-data.frame(stringsAsFactors = F)
+  subset_phylos<-prune_taxa(taxa_names(which.phyloseq)%in%which.taxa,which.phyloseq)
+  SSUMS<-sample_sums(which.phyloseq)
+  for(i in 1: length(which.taxa))
+    {
+      actual.phylos<-prune_taxa(taxa_names(which.phyloseq)%in%which.taxa[i],which.phyloseq)
+      Abundance<-as.numeric(otu_table(actual.phylos))  
+      OTU<-rep(which.taxa[i],length(Abundance))
+      Seq.tot<-rep(SSUMS[i],length(Abundance))
+      Seq.tot<-SSUMS
+      Taxo.actual<-as.character(tax_table(actual.phylos))
+      if(manage.ussigned==T){
+        for(j in 2: length(Taxo.actual)){
+          if(is.na(Taxo.actual[j])){Taxo.actual[j]<-ifelse(regexpr(unassign.string,Taxo.actual[j-1])>0,
+                                           Taxo.actual[j-1],paste(Taxo.actual[j-1],unassign.string,sep=""))}
+        }
+      }
+      
+      Taxo.actual.rbind<-do.call("rbind", replicate(length(sample_sums(actual.phylos)), Taxo.actual, simplify = FALSE))
+      colnames(Taxo.actual.rbind)<-colnames(tax_table(which.phyloseq))
+      Sd<-sample_data(actual.phylos)
+      TEMP<-data.frame(Abundance,OTU,Seq.tot,Taxo.actual.rbind,Sd,stringsAsFactors = F)
+      RESULT<-rbind(RESULT,TEMP)
+    }
+    RESULT
+}
+```
+
+
+
+
+# Decriptive statistics
+
+```{r fig.width=15,fig.height=15}
+load("/media/kreising/DATA/data/HM_hybrid_zone_all/PHYLOSEQs/PHYLOSEQ_16S_HZ_final.1000.R")
+
+
+PHYLOSEQ_16S_HZ_final.1000<-prune_taxa(taxa_sums(PHYLOSEQ_16S_HZ_final.1000)>0,PHYLOSEQ_16S_HZ_final.1000)
+PHYLOSEQ_16S_HZ_final.1000
+summary(sample_sums(PHYLOSEQ_16S_HZ_final.1000))
+sum(otu_table(PHYLOSEQ_16S_HZ_final.1000))
+save(PHYLOSEQ_16S_HZ_final.1000,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PHYLOSEQs/PHYLOSEQ_16S_HZ_final.1000.R")
+```
+
+
+
+# Alpha diversity - data preparation
+
+
+```{r fig.width=15,fig.height=15}
+library(spaMM)
+
+
+PHYLOSEQ_16S_HZ_final.1000.rare<-rarefy_even_depth(PHYLOSEQ_16S_HZ_final.1000)
+RICH<-estimate_richness(PHYLOSEQ_16S_HZ_final.1000.rare,measures = c("Observed","Shannon"))
+RICH<-data.frame(RICH,sample_data(PHYLOSEQ_16S_HZ_final.1000.rare))
+
+
+```
+
+# Alpha diversita (ASV richness) - SPAMM mixed models
+
+```{r fig.width=15,fig.height=15}
+
+RICH$Transect_REG<-RICH$Transect=="HZ_REG"
+RICH$Transect_CZ<-RICH$Transect!="HZ_REG"
+
+
+#AIC for A) spatial and B) non-spatial models
+m_spamm_null_sp <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "REML",
+                           control.glm=list(maxit=200))
+
+
+m_spamm_null_loc <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "REML",
+                           control.glm=list(maxit=200))
+
+
+AIC(m_spamm_null_sp)
+AIC(m_spamm_null_loc)
+
+
+############################################
+#ASV richness (spatial) - model selection ##
+############################################
+#FUll model
+m1 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                             Species:Admix+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species:Admix
+m2 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                            (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Admix
+m3 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Species
+m4 <- fitme(log10(Observed) ~Gravid_my+BW+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Gravid_my
+m5 <- fitme(log10(Observed) ~BW+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without BW
+m6 <- fitme(log10(Observed) ~Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Transect
+m7 <- fitme(log10(Observed) ~1+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m1,m2)$ basicLRT
+A2<-anova(m2,m3)$ basicLRT
+A3<-anova(m4,m3)$ basicLRT
+A4<-anova(m4,m5)$ basicLRT
+A5<-anova(m6,m5)$ basicLRT
+A6<-anova(m6,m7)$ basicLRT
+
+OBS_sp<-data.frame(Predictor=c("Species x Admix","Admix","Species","Gravid_my","BW","Transect"),
+                   Response="Observed",
+                   rbind(A1,A2,A3,A4,A5,A6))
+#Fixed effects for the full model
+FIXED_obs_sp<-summary(m1)$beta_table
+################################################
+#ASV richness (non-spatial) - model selection ##
+################################################
+#Full model
+m1 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                            Species:Admix+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species:Admix
+m2 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Admix
+m3 <- fitme(log10(Observed) ~Gravid_my+BW+Species+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Species
+m4 <- fitme(log10(Observed) ~Gravid_my+BW+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Gravid_my
+m5 <- fitme(log10(Observed) ~BW+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without BW
+m6 <- fitme(log10(Observed) ~Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+##without Transect
+m7 <- fitme(log10(Observed) ~1+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m1,m2)$ basicLRT
+A2<-anova(m2,m3)$ basicLRT
+A3<-anova(m4,m3)$ basicLRT
+A4<-anova(m4,m5)$ basicLRT
+A5<-anova(m6,m5)$ basicLRT
+A6<-anova(m6,m7)$ basicLRT
+OBS_nonsp<-data.frame(Predictor=c("Species x Admix","Admix","Species","Gravid_my","BW","Transect"),
+                   Response="Observed",
+                   rbind(A1,A2,A3,A4,A5,A6))
+#Parameters - Full model
+FIXED_obs_nonsp<-summary(m1)$beta_table
+
+```
+
+# Alpha diversity (Shannon) - SPAMM mixed models
+```{r fig.width=15,fig.height=15}
+#AIC for A) spatial and B) non-spatial models
+m_spamm_null_sp <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "REML",
+                           control.glm=list(maxit=200))
+
+m_spamm_null_loc <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "REML",
+                           control.glm=list(maxit=200))
+
+AIC(m_spamm_null_sp)
+AIC(m_spamm_null_loc)
+#########################################
+#Shannon (spatial) - model selection#####
+#########################################
+#Full model
+m1 <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species:Admix
+m2 <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Gravid_my
+m3 <- fitme(Shannon ~BW+Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without BW
+m4 <- fitme(Shannon ~Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Species
+m5 <- fitme(Shannon ~Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Admix
+m6 <- fitme(Shannon ~Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Transect
+m7 <- fitme(Shannon ~1+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m1,m2)$ basicLRT
+A2<-anova(m2,m3)$ basicLRT
+A3<-anova(m4,m3)$ basicLRT
+A4<-anova(m4,m5)$ basicLRT
+A5<-anova(m6,m5)$ basicLRT
+A6<-anova(m6,m7)$ basicLRT
+
+SH_sp<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Species","Admix","Transect"),
+                   Response="Shannon",
+                   rbind(A1,A2,A3,A4,A5,A6))
+SH_sp
+FIXED_sh_sp<-summary(m1)$beta_table
+#############################################
+#Shannon (non-spatial) - model selection#####
+#############################################
+#Full model
+m1 <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Species:Admix
+m2 <- fitme(Shannon ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Gravid_my
+m3 <- fitme(Shannon ~BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without BW
+m4 <- fitme(Shannon ~Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species
+m5 <- fitme(Shannon ~Admix+Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m6 <- fitme(Shannon ~Transect+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m7 <- fitme(Shannon ~1+
+                           (1|Locality_my),
+                           data = RICH, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m1,m2)$ basicLRT
+A2<-anova(m2,m3)$ basicLRT
+A3<-anova(m4,m3)$ basicLRT
+A4<-anova(m4,m5)$ basicLRT
+A5<-anova(m6,m5)$ basicLRT
+A6<-anova(m6,m7)$ basicLRT
+
+SH_nonsp<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Species","Admix","Transect"),
+                   Response="Shannon",
+                   rbind(A1,A2,A3,A4,A5,A6))
+SH_nonsp
+FIXED_sh_nonsp<-summary(m1)$beta_table
+```
+
+# 3.D Alpha diversity -final tables
+
+```{r fig.width=15,fig.height=15}
+
+DF<-data.frame(rbind(cbind(OBS_sp[,c(1,2,4,3,5)],OBS_nonsp[,c(3,5)]),
+                     cbind(SH_sp[,c(1,2,4,3,5)],SH_nonsp[,c(3,5)])))
+
+write.table(DF,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ALPHA.table_interactions.txt",
+            sep="\t",row.names = F,quote = F)
+DF
+
+
+DF.fixed<-data.frame(Predictor=rep(rownames(FIXED_obs_sp),2),
+                     Response=rep(c("Observed","Shannon"),each=dim(FIXED_obs_sp)[1]),
+                     rbind(cbind(FIXED_obs_sp,FIXED_obs_nonsp),
+                           cbind(FIXED_sh_sp,FIXED_sh_nonsp)))
+DF.fixed
+write.table(DF.fixed,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ALPHA_param_interactions.txt",
+            sep="\t",row.names = F,quote = F)
+
+```
+
+
+# PCoA - Bray-Curtis and Jaccard dissimilarities
+
+```{r fig.width=15,fig.height=15}
+
+#######################################
+#Bray-Curtis + Jaccard dissimilarities#
+#######################################
+
+sample_data(PHYLOSEQ_16S_HZ_final.1000)$Admix_sq.rt<-sample_data(PHYLOSEQ_16S_HZ_final.1000)$Admix^0.5
+sample_data(PHYLOSEQ_16S_HZ_final.1000)$Admix_cat<-ifelse(sample_data(PHYLOSEQ_16S_HZ_final.1000)$Admix>0.15,"admixed","non-admixed")
+
+PHYLOSEQ_16S_HZ_final.1000.trans<-transform_sample_counts(PHYLOSEQ_16S_HZ_final.1000, function(x) x/sum(x))
+PHYLOSEQ_16S_HZ_final.1000.rare<-rarefy_even_depth(PHYLOSEQ_16S_HZ_final.1000)
+PHYLOSEQ_16S_HZ_final.1000.clr <- microbiome::transform(PHYLOSEQ_16S_HZ_final.1000, "clr")
+
+bc<-vegdist(otu_table(PHYLOSEQ_16S_HZ_final.1000.trans)^0.5)
+ja<-vegdist(data.frame(otu_table(PHYLOSEQ_16S_HZ_final.1000.rare)),method = "jaccard",binary = T)
+
+###PCoA - Bray-Curtis #####################
+bc.ord<-ordinate(PHYLOSEQ_16S_HZ_final.1000.trans,distance=bc,method = "PCoA")
+Transect.labs<-c("Transect: Bavarian","Transect: Regensburg")
+Species.labs<-c("Subspecies: MMD","Subspecies: MMM")
+names(Transect.labs)<-levels(as.factor(sample_data(PHYLOSEQ_16S_HZ_final.1000.trans)$Transect))
+names(Species.labs)<-levels(as.factor(sample_data(PHYLOSEQ_16S_HZ_final.1000.trans)$Species))
+ORD_PLOT<-plot_ordination(PHYLOSEQ_16S_HZ_final.1000.trans,bc.ord,color = "Admix_sq.rt")+
+               facet_grid(Transect~Species,labeller = labeller(Transect = Transect.labs, 
+                                                               Species = Species.labs))
+
+plot_ordination(PHYLOSEQ_16S_HZ_final.1000.trans,bc.ord,color = "Admix",axes = c(1,3))+
+               facet_grid(Transect~Species,labeller = labeller(Transect = Transect.labs, 
+                                                               Species = Species.labs))
+
+ORD_PLOT<-ORD_PLOT+theme_bw()+scale_color_continuous(type = "viridis")+geom_point(size=2,alpha=0.5)
+ORD_PLOT$layers[[1]]<-NULL
+ORD_PLOT.bc<-ORD_PLOT
+
+DF.bc<-bc.ord$vectors
+DF.bc<-data.frame(DF.bc,sample_data(PHYLOSEQ_16S_HZ_final.1000.rare))
+
+
+
+###PCoA - Jaccard#############
+ja.ord<-ordinate(PHYLOSEQ_16S_HZ_final.1000.rare,method = "PCoA",distance=ja)
+Transect.labs<-c("Transect: Bavarian","Transect: Regensburg")
+Species.labs<-c("Subspecies: MMD","Subspecies: MMM")
+names(Transect.labs)<-levels(as.factor(sample_data(PHYLOSEQ_16S_HZ_final.1000.trans)$Transect))
+names(Species.labs)<-levels(as.factor(sample_data(PHYLOSEQ_16S_HZ_final.1000.trans)$Species))
+ORD_PLOT<-plot_ordination(PHYLOSEQ_16S_HZ_final.1000.trans,ja.ord,color = "Admix_sq.rt")+
+               facet_grid(Transect~Species,labeller = labeller(Transect = Transect.labs, 
+                                                               Species = Species.labs))
+
+ORD_PLOT<-ORD_PLOT+theme_bw()+scale_color_continuous(type = "viridis")+geom_point(size=2,alpha=0.5)
+ORD_PLOT$layers[[1]]<-NULL
+ORD_PLOT.ja<-ORD_PLOT
+
+DF.ja<-(ja.ord)$vectors
+DF.ja<-data.frame(DF.ja,sample_data(PHYLOSEQ_16S_HZ_final.1000.rare))
+
+
+# final figures
+ggsave(ORD_PLOT.bc,
+       filename = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ORD_PLOT.bc.pdf",
+       width = 8, height = 8,units="cm")
+ggsave(ORD_PLOT.ja,
+       filename = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ORD_PLOT.ja.pdf",
+       width = 8, height = 8,units="cm")
+
+ORD_PLOT.bc<-ORD_PLOT.bc+ggtitle("A) Bray-Curtis")
+ORD_PLOT.ja<-ORD_PLOT.ja+ggtitle("B) Jaccard")
+
+small.fig<-function(x){x+theme(strip.text = element_text(size=8),
+                               axis.text.x = element_text(size=6),
+                               axis.text.y = element_text(size=6),
+                               axis.title.x = element_text(size=8),
+                               axis.title.y = element_text(size=8),
+                               legend.title = element_blank())}
+
+ORD_PLOT.bc.s<-small.fig(ORD_PLOT.bc)
+ORD_PLOT.ja.s<-small.fig(ORD_PLOT.ja)
+GRID<-ggarrange(ORD_PLOT.bc.s,ORD_PLOT.ja.s,common.legend = T,legend="bottom")
+ggsave(GRID,filename = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/PCOA_AIT.pdf",
+       width = 18, height = 12,units = "cm")
+
+GRID
+
+# save gg objects
+save(ORD_PLOT.bc.s,
+     file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ORD_PLOT.bc.s_AIT.R")
+save(ORD_PLOT.ja.s,
+     file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/ORD_PLOT.ja.s_AIT.R")
+```
+
+
+# Major gradients - Jaccard (spatial)
+
+```{r fig.width=15,fig.height=15}
+DF.ja<-(ja.ord)$vectors
+DF.ja<-data.frame(DF.ja,sample_data(PHYLOSEQ_16S_HZ_final.1000.rare))
+
+##############################
+#JACCARD AXIS 1###############
+##############################
+
+# AIC spatial vs non-*spatial
+DF.ja$Transect_REG<-DF.ja$Transect=="HZ_REG"
+DF.ja$Transect_CZ<-DF.ja$Transect!="HZ_REG"
+
+m_spamm_null_sp <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "REML",
+                           control.glm=list(maxit=200))
+
+
+m_spamm_null_loc <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "REML",
+                           control.glm=list(maxit=200))
+
+m_spamm_null_0 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+ Transect,
+                           data = DF.ja, method = "REML",
+                           control.glm=list(maxit=200))
+
+
+AIC.ja.1.sp<-print(get_any_IC(m_spamm_null_sp, nsim=100L, seed=123,nb_cores=4))
+AIC.ja.1.loc<-print(get_any_IC(m_spamm_null_loc, nsim=100L, seed=123,nb_cores=4))
+
+
+##############################################
+#JACCARD AXIS 1 (spatial) - model selection###
+##############################################
+
+#Full model
+m1 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species:Admix
+m2 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#without Admix
+m3 <- fitme(Axis.1 ~Gravid_my+BW+Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#without Gravid_my
+m4 <- fitme(Axis.1 ~BW+Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without BW
+m5 <- fitme(Axis.1 ~Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species
+m6 <- fitme(Axis.1 ~BW+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Transect
+m7 <- fitme(Axis.1 ~BW+Species+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m4,m6)$basicLRT
+A6<-anova(m4,m6)$basicLRT
+DF.JA.AX1<-data.frame(Predictor=c("Species x Admix","Admix","Gravid_my","BW","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.JA.AX1<-summary(m1)$beta_table
+
+##############################
+#JACCARD AXIS 2###############
+##############################
+
+# AIC spatial vs non-*spatial
+
+m_spamm_null_sp <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+m_spamm_null_loc <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+AIC.ja.2.sp<-AIC(m_spamm_null_sp)
+AIC.ja.2.loc<-AIC(m_spamm_null_loc)
+
+
+###########################################
+#JACCARD AXIS 2 (spatial) - model selection#
+########################################### 
+#Full model
+m1 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           Admix:Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#Without interaction
+m2 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Gravid_my
+m3 <- fitme(Axis.2 ~BW+Species+Admix+Transect+
+                           (1|Locality_my) + 
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#Without BW
+m4 <- fitme(Axis.2 ~Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m5 <- fitme(Axis.2 ~Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species
+m6 <- fitme(Axis.2 ~Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Transect
+m7 <- fitme(Axis.2 ~Species+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m5,m6)$basicLRT
+A7<-anova(m7,m5)$basicLRT
+
+DF.JA.AX2<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A7))
+
+FULL.JA.AX2<-summary(m1)$beta_table
+```
+
+# Major gradients - Jaccard (non - spatial)
+
+```{r fig.width=15,fig.height=15}
+#################################################
+#JACCARD AXIS 1 (non- spatial) - model selection#
+#################################################
+
+# Full models
+m1 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# without Species:Admix
+m2 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) ,
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# without Gravid_my
+m3 <- fitme(Axis.1 ~BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# without Admix
+m4 <- fitme(Axis.1 ~BW+Species+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# without BW
+m5 <- fitme(Axis.1 ~Species+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# without Species
+m6 <- fitme(Axis.1 ~BW+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# without Transect
+m7 <- fitme(Axis.1 ~BW+Species+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m4,m6)$basicLRT
+A6<-anova(m4,m7)$basicLRT
+
+DF.JA.AX1_nonsp<-data.frame(Predictor=c("Species x Admix","Gravid_my","Admix","BW","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.JA.AX1_nonsp<-summary(m1)$beta_table
+
+#################################################
+#JACCARD AXIS 2 (non- spatial) - model selection#
+#################################################
+
+#Full model
+m1 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           Admix:Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# Without Admix:Transect
+m2 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# Without Gravid_my
+m3 <- fitme(Axis.2 ~BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# Without BW
+m4 <- fitme(Axis.2 ~Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# Without Transect
+m5 <- fitme(Axis.2 ~Species+Admix+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# Without Admix
+m6 <- fitme(Axis.2 ~Species+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+# Without Species
+m7 <- fitme(Axis.2 ~Admix+
+                           (1|Locality_my),
+                           data = DF.ja, method = "ML",
+                           control.glm=list(maxit=200))
+
+# LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m5,m6)$basicLRT
+A6<-anova(m5,m7)$basicLRT
+
+DF.JA.AX2_nonsp<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Transect","Admix","Species"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.JA.AX2_nonsp<-summary(m1)$beta_table
+
+```
+
+
+# Major gradients - Bray-Curtis (spatial)
+
+```{r fig.width=15,fig.height=15}
+
+
+DF.bc<-bc.ord$vectors
+DF.bc<-data.frame(DF.bc,sample_data(PHYLOSEQ_16S_HZ_final.1000.rare))
+names(DF.bc)[1:2]<-c("Axis.1","Axis.2")
+
+DF.bc$Transect_REG<-DF.bc$Transect=="HZ_REG"
+DF.bc$Transect_CZ<-DF.bc$Transect!="HZ_REG"
+
+##############################
+#BRAY CURTIS AXIS 1###########
+##############################
+
+# AIC spatial vs non-*spatial
+m_spamm_null_sp <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+m_spamm_null_loc <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+AIC.bc.1.sp<-print(get_any_IC(m_spamm_null_sp, nsim=100L, seed=123,nb_cores=4))
+AIC.bc.1.loc<-print(get_any_IC(m_spamm_null_loc, nsim=100L, seed=123,nb_cores=4))
+
+
+
+##############################################
+#BRAY CURTIS 1 (spatial) - model selection###
+##############################################
+
+# Full model
+m1 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Species:Admix
+m2 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Gravid_my
+m3 <- fitme(Axis.1 ~BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Admix
+m4 <- fitme(Axis.1 ~BW+Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Withoutv BW
+m5 <- fitme(Axis.1 ~Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Species
+m6 <- fitme(Axis.1 ~BW+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m7 <- fitme(Axis.1 ~BW+Species+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m4,m6)$basicLRT
+A6<-anova(m4,m7)$basicLRT
+
+DF.BC.AX1<-data.frame(Predictor=c("Species x Admix","Gravid_my","Admix","BW","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.BC.AX1<-summary(m1)$beta_table
+##############################
+#BRAY CURTIS AXIS 1###########
+##############################
+
+
+# AIC spatial vs non-*spatial
+m_spamm_null_sp <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "REML",
+                           control.glm=list(maxit=200))
+
+m_spamm_null_loc <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "REML",
+                           control.glm=list(maxit=200))
+
+AIC.bc.2.sp<-print(get_any_IC(m_spamm_null_sp, nsim=100L, seed=123,nb_cores=4))
+AIC.bc.2.loc<-print(get_any_IC(m_spamm_null_loc, nsim=100L, seed=123,nb_cores=4))
+
+
+##############################################
+#BRAY CURTIS 2 (spatial) - model selection###
+##############################################
+
+# Full model
+m1 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species:Admix
+m2 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without Gravid_my
+m3 <- fitme(Axis.2 ~BW+Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without BW
+m4 <- fitme(Axis.2 ~Species+Admix+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Admix
+m5 <- fitme(Axis.2 ~Species+Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Species
+m6 <- fitme(Axis.2 ~Transect+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without Transect
+m7 <- fitme(Axis.2 ~Species+
+                           (1|Locality_my) +  
+                           Matern(Transect_REG | X_Longit_mean+ Y_Latit_mean)+
+                           Matern(Transect_CZ | X_Longit_mean+ Y_Latit_mean),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+# LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m5,m6)$basicLRT
+A6<-anova(m5,m7)$basicLRT
+
+DF.BC.AX2<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+DF.BC.AX1
+FULL.BC.AX2<-summary(m1)$beta_table
+```
+
+# Major gradients - Bray-Curtis (non-spatial)
+```{r fig.width=15,fig.height=15}
+
+#################################################
+#BRAY CURTIS 1 (non-spatial) - model selection###
+#################################################
+
+#full model
+m1 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without interaction
+m2 <- fitme(Axis.1 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my) ,
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Gravid_my
+m3 <- fitme(Axis.1 ~BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without Admix
+m4 <- fitme(Axis.1 ~BW+Species+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without BW
+m5 <- fitme(Axis.1 ~Species+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#without Species
+m6 <- fitme(Axis.1 ~BW+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#without Transect
+m7 <- fitme(Axis.1 ~BW+Species+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m4,m6)$basicLRT
+A6<-anova(m4,m7)$basicLRT
+
+DF.BC.AX1_nonsp<-data.frame(Predictor=c("Species x Admix","Gravid_my","Admix","BW","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+FULL.BC.AX1_nonsp<-summary(m1)$beta_table
+
+#################################################
+#BRAY CURTIS 2 (non-spatial) - model selection###
+#################################################
+
+#full model
+m1 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Species:Admix
+m2 <- fitme(Axis.2 ~Gravid_my+BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Gravid_my
+m3 <- fitme(Axis.2 ~BW+Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without BW
+m4 <- fitme(Axis.2 ~Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m5 <- fitme(Axis.2 ~Species+Admix+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m6 <- fitme(Axis.2 ~Species+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+#Without Species
+m7 <- fitme(Axis.2 ~Admix+Transect+
+                           (1|Locality_my),
+                           data = DF.bc, method = "ML",
+                           control.glm=list(maxit=200))
+# LR tests
+A1<-anova(m1,m2)$basicLRT
+A2<-anova(m2,m3)$basicLRT
+A3<-anova(m3,m4)$basicLRT
+A4<-anova(m4,m5)$basicLRT
+A5<-anova(m4,m6)$basicLRT
+A6<-anova(m4,m7)$basicLRT
+
+DF.BC.AX2_nonsp<-data.frame(Predictor=c("Species x Admix","Gravid_my","BW","Transect","Admix","Species"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.BC.AX2_nonsp<-summary(m1)$beta_table
+
+
+```
+
+# Major gradients - final tables 
+
+```{r fig.width=15,fig.height=15}
+####AIC TABLE################
+JA.BC_aic.loc<-c(AIC.bc.1.loc[3],AIC.bc.2.loc[3],AIC.ja.1.loc[3],AIC.ja.2.loc[3])
+JA.BC_aic.sp<-c(AIC.bc.1.sp[3],AIC.bc.2.sp[3],AIC.ja.1.sp[3],AIC.ja.2.sp[3])
+
+DF_aic<-data.frame(Dissimilarity=c("Bray-Curtis","","Jaccard",""),
+                   Axis=c("Axis 1","Axis 2","Axis 1","Axis 2"),
+                   AIC_spatial=JA.BC_aic.sp,
+                   AIC_nonspatial=JA.BC_aic.loc)
+DF_aic.boot<-DF_aic
+DF_aic.boot
+
+JA.BC_aic.loc<-c(AIC.bc.1.loc[2],AIC.bc.2.loc[2],AIC.ja.1.loc[2],AIC.ja.2.loc[2])
+JA.BC_aic.sp<-c(AIC.bc.1.sp[2],AIC.bc.2.sp[2],AIC.ja.1.sp[2],AIC.ja.2.sp[2])
+
+DF_aic<-data.frame(Dissimilarity=c("Bray-Curtis","","Jaccard",""),
+                   Axis=c("Axis 1","Axis 2","Axis 1","Axis 2"),
+                   AIC_spatial=JA.BC_aic.sp,
+                   AIC_nonspatial=JA.BC_aic.loc)
+DF_aic
+
+write.table(DF_aic,
+            file="/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/AIC.PCOA.bact_AIT.txt",
+            sep="\t",row.names = F)
+
+###########MODEL SELECTION####################
+DF.BC.AX2_nonsp <- DF.BC.AX2_nonsp[order(DF.BC.AX2_nonsp$Predictor),]
+DF.BC.AX1_nonsp <- DF.BC.AX1_nonsp[order(DF.BC.AX1_nonsp$Predictor),]
+DF.JA.AX2_nonsp <- DF.JA.AX2_nonsp[order(DF.JA.AX2_nonsp$Predictor),]
+DF.JA.AX1_nonsp <- DF.JA.AX1_nonsp[order(DF.JA.AX1_nonsp$Predictor),]
+
+DF.BC.AX2 <- DF.BC.AX2[order(DF.BC.AX2$Predictor),]
+DF.BC.AX1 <- DF.BC.AX1[order(DF.BC.AX1$Predictor),]
+DF.JA.AX2 <- DF.JA.AX2[order(DF.JA.AX2$Predictor),]
+DF.JA.AX1 <- DF.JA.AX1[order(DF.JA.AX1$Predictor),]
+
+DD1<-data.frame(DF.BC.AX1[,c(1,3,2,4)],DF.BC.AX1_nonsp[,c(2,4)])
+DD2<-data.frame(DF.BC.AX2[,c(1,3,2,4)],DF.BC.AX2_nonsp[,c(2,4)])
+DD3<-data.frame(DF.JA.AX1[,c(1,3,2,4)],DF.JA.AX1_nonsp[,c(2,4)])
+DD4<-data.frame(DF.JA.AX2[,c(1,3,2,4)],DF.JA.AX2_nonsp[,c(2,4)])
+
+DF<-data.frame(Dissimilarity=rep(c("Bray-Curtis","Jaccard"),each=dim(DD1)[1]*2),
+           Axis=rep(c("axis1","axis2","axis1","axis2"),each=dim(DD1)[1]),
+           rbind(DD1,DD2,DD3,DD4))
+
+DF
+
+write.table(DF,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/PCO_lmm_bact_interaction_AIT.txt",
+            sep = "\t",quote = F,row.names = F)
+
+#Comparing LR statistics for spatial vs. non-spatial models
+t.test(DF$chi2_LR,DF$chi2_LR.1,paired = T)
+
+
+#################PARAMETER ESTIMATES#############
+
+DF.EST<-data.frame(Predictor=rep(rownames(FULL.BC.AX1),4),
+                   Dissimilarity=rep(c("Bray-Curtis","Jaccard"),each=dim(FULL.BC.AX1)[1]*2),
+                   Axis=rep(c("axis1","axis2","axis1","axis2"),each=dim(FULL.BC.AX1)[1]),
+                   rbind(cbind(FULL.BC.AX1,FULL.BC.AX1_nonsp),
+                         cbind(FULL.BC.AX2,FULL.BC.AX2_nonsp),
+                         cbind(FULL.JA.AX1,FULL.JA.AX1_nonsp),
+                         cbind(FULL.JA.AX2,FULL.JA.AX2_nonsp)))
+
+write.table(DF.EST,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/PCO_lmm_parameters_bact_interactions_AIT.txt",
+            sep = "\t",quote = F,row.names = F)
+
+DF.EST.0<-DF.EST[-grep("Interc",rownames(DF.EST)),]
+
+#Comparing Estimates and S.E. for spatial vs. non-spatial models
+t.test(abs(DF.EST.0$Estimate),abs(DF.EST.0$Estimate.1),paired=T)
+t.test(DF.EST.0$Cond..SE,DF.EST.0$Cond..SE.1,paired=T)
+
+
+```
+
+# db-RDA on PCNM axes - (variation in microbiota composition explained by spatial correlation) 
+
+```{r fig.width=15,fig.height=15,warning=F,message=F}
+library(ape)
+PHYLOSEQ_16S_HZ_final.1000.rare<-rarefy_even_depth(PHYLOSEQ_16S_HZ_final.1000)
+bc<-dist(otu_table(PHYLOSEQ_16S_HZ_final.1000.clr))
+ja<-vegdist(data.frame(otu_table(PHYLOSEQ_16S_HZ_final.1000.rare)),binary = T,method = "jaccard")
+bc<-as.matrix(bc)
+ja<-as.matrix(ja)
+NAMES<-paste(sample_names(PHYLOSEQ_16S_HZ_final.1000.rare),
+             sample_data(PHYLOSEQ_16S_HZ_final.1000)$Locality_my,
+             sample_data(PHYLOSEQ_16S_HZ_final.1000)$Transect,sep="~")
+
+SD<-sample_data(PHYLOSEQ_16S_HZ_final.1000)
+
+# colnames(bc)<-rownames(bc)<-NAMES
+# colnames(ja)<-rownames(ja)<-NAMES
+
+ja.pc<-pcoa(ja)$vectors
+# bc.pc<-pcoa(bc)$vectors
+
+ja.pc.centr<-apply(ja.pc,2,function(x) tapply(x,SD$Locality_my,mean))
+bc.pc.centr<-apply(bc,2,function(x) tapply(x,SD$Locality_my,mean))
+
+X_centr<-tapply(SD$X_Longit_mean,SD$Locality_my,mean)
+Y_centr<-tapply(SD$Y_Latit_mean,SD$Locality_my,mean)
+GEO<-data.frame(X_centr,Y_centr)
+
+PCNM.vegan<-pcnm(dist(GEO))
+
+#rda for ja
+rda.vasc.sp.1<-rda(ja.pc.centr~.,data=data.frame(PCNM.vegan$vectors))
+rda.vasc.sp.0<-rda(ja.pc.centr~1,data=data.frame(PCNM.vegan$vectors))
+sel.osR2.sp <- ordistep (rda.vasc.sp.0, scope = formula (rda.vasc.sp.1), direction = 'forward')
+RsquareAdj(sel.osR2.sp)
+anova(sel.osR2.sp)
+sel.osR2.sp.ja<-sel.osR2.sp
+
+# rda for bc
+rda.vasc.sp.1<-rda(bc.pc.centr~.,data=data.frame(PCNM.vegan$vectors))
+rda.vasc.sp.0<-rda(bc.pc.centr~1,data=data.frame(PCNM.vegan$vectors))
+sel.osR2.sp <- ordistep (rda.vasc.sp.0, scope = formula (rda.vasc.sp.1), direction = 'forward')
+RsquareAdj(sel.osR2.sp)
+anova(sel.osR2.sp)
+sel.osR2.sp.bc<-sel.osR2.sp
+
+
+```
+ 
+# Whole community approach (MDMR mixed models)
+
+```{r fig.width=15,fig.height=15}
+
+
+#ANOVA for db-RDA (full model)
+ANOVA.sp.bc.g<-anova(sel.osR2.sp.bc)
+ANOVA.sp.ja.g<-anova(sel.osR2.sp.ja)
+ANOVA.sp.bc.g
+ANOVA.sp.ja.g
+
+#ANOVA for db-RDA (marginal effects)
+ANOVA.sp.bc<-anova(sel.osR2.sp.bc,by="margin")
+ANOVA.sp.ja<-anova(sel.osR2.sp.ja,by="margin")
+
+
+#PCNM Axes that were significant (after holm multiple testing corrrection) 
+ANOVA.sp.bc$p.adjusted<-p.adjust(ANOVA.sp.bc[,4],method = "holm")
+NAMES.bc<-rownames(ANOVA.sp.bc)[ANOVA.sp.bc$p.adjusted<0.05]
+NAMES.bc<-NAMES.bc[!is.na(NAMES.bc)]
+
+FORMULA.bc<-as.formula(paste("~", paste(NAMES.bc,collapse = " + ")))
+
+ANOVA.sp.ja$p.adjusted<-p.adjust(ANOVA.sp.ja[,4],method = "holm")
+NAMES.ja<-rownames(ANOVA.sp.ja)[ANOVA.sp.ja$p.adjusted<0.05]
+NAMES.ja<-NAMES.bc[!is.na(NAMES.ja)]
+
+FORMULA.ja<-as.formula(paste("~", paste(NAMES.ja,collapse = " + ")))
+
+
+#Refitting dbRDA model (just significant PCNM axes) + R squared
+PCNNM.vectors<-data.frame(PCNM.vegan$vectors)
+PCNNM.vectors.sig<-PCNNM.vectors[,colnames(PCNNM.vectors)%in%NAMES.ja]
+PCNNM.vectors.sig.ja<-PCNNM.vectors.sig
+rda.vasc.sp.1<-rda(ja.pc.centr~.,data=data.frame(PCNNM.vectors.sig))
+anova(rda.vasc.sp.1)
+RsquareAdj(rda.vasc.sp.1)
+
+PCNNM.vectors.sig<-PCNNM.vectors[,colnames(PCNNM.vectors)%in%NAMES.bc]
+PCNNM.vectors.sig.bc<-PCNNM.vectors.sig
+rda.vasc.sp.1<-rda(bc.pc.centr~.,data=data.frame(PCNNM.vectors.sig))
+anova(rda.vasc.sp.1)
+RsquareAdj(rda.vasc.sp.1)
+
+# Data frame for MDMR mixed models
+PCNNM.vectors<-data.frame(PCNM.vegan$vectors)
+PCNNM.vectors$Locality_my<-rownames(PCNNM.vectors)
+SD<-data.frame(sample_data(PHYLOSEQ_16S_HZ_final.1000))
+SD<-join(SD,PCNNM.vectors)
+SD$DUMMY<-"a"
+
+OTU_TABLE<-data.frame(otu_table(PHYLOSEQ_16S_HZ_final.1000))
+
+X.mat<-SD[,names(SD)%in%c("Gravid_my","BW","Species","Admix","Transect")]
+
+# Formula for MDMR mixed models
+FORMULA.bc<-(paste(c( colnames(PCNNM.vectors.sig.bc),
+                                        "Gravid_my+BW+Species+Admix+Transect+Species:Admix+ (1|Locality_my)"),
+                                        collapse = " + "))
+FORMULA.bc<-as.formula(paste("~",FORMULA.bc))
+
+FORMULA.ja<-(paste(c( colnames(PCNNM.vectors.sig.ja),
+                                        "Gravid_my+BW+Species+Admix+Transect+Species:Admix+ (1|Locality_my)"),
+                                        collapse = " + "))
+FORMULA.ja<-as.formula(paste("~",FORMULA.ja))
+
+
+#MDMR Bray-Curtis (non-spatial)
+mdmr.bc.nonsp <- MDMR::mixed.mdmr(~Gravid_my+BW+Species+Admix+Transect+
+                                    Species:Admix+
+                               (1|Locality_my),
+                               data =SD,D = bc,
+                               ncores=4)
+
+#MDMR Bray-Curtis (spatial)
+mdmr.bc.sp <- MDMR::mixed.mdmr(~PCNM1+PCNM2+PCNM3+PCNM4+PCNM5+
+                                Gravid_my+BW+Species+Admix+Transect+
+                                 Species:Admix+
+                               (1|Locality_my),
+                               data =SD,D = bc,
+                               ncores=4)
+
+#MDMR Jaccard (non-spatial)
+mdmr.ja.nonsp <- MDMR::mixed.mdmr(~Gravid_my+BW+Species+Admix+Transect+
+                                    Species:Admix+
+                               (1|Locality_my),
+                               data =SD,D = ja,
+                               ncores=4)
+
+#MDMR Jaccard (spatial)
+mdmr.ja.sp <- MDMR::mixed.mdmr(~PCNM1+PCNM2+PCNM3+PCNM4+PCNM5+
+                                Gravid_my+BW+Species+Admix+Transect+
+                                 Species:Admix+
+                               (1|Locality_my),
+                               data =SD,D = ja,
+                               ncores=4)
+
+# Table for MDMR results
+mdmr.bc.nonsp.T<-summary(mdmr.bc.nonsp)
+mdmr.bc.sp.T<-summary(mdmr.bc.sp)
+mdmr.ja.nonsp.T<-summary(mdmr.ja.nonsp)
+mdmr.ja.sp.T<-summary(mdmr.ja.sp)
+
+mdmr.bc.sp.T<-mdmr.bc.sp.T[-grep("PCNM",rownames(mdmr.bc.sp.T)),]
+mdmr.ja.sp.T<-mdmr.ja.sp.T[-grep("PCNM",rownames(mdmr.ja.sp.T)),]
+
+DF<-data.frame(Dissimilarity=rep(c("Bray-Curtis","Jaccard"),each=dim(mdmr.bc.sp.T)[1]),
+           Predictor=rep(rownames(mdmr.bc.sp.T),2),
+           rbind(cbind(mdmr.bc.sp.T[,c(2,1,3)],mdmr.bc.nonsp.T[,c(1,3)]),
+           cbind(mdmr.ja.sp.T[,c(2,1,3)],mdmr.ja.nonsp.T[,c(1,3)])))
+
+DF<-DF[DF$Predictor!="Omnibus",]
+
+write.table(DF, file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/MDMR_table_interactions_AIT.txt",
+            sep="\t",quote = F,row.names = F)
+
+# Comparing MDMR test statistics for spatial vs. non-spatial models
+DF2<-DF[-grep("Interc",DF$Predictor),]
+DF2
+t.test(DF2$Statistic,DF2$Statistic.1,paired = T)
+mean(DF2$Statistic)
+mean(DF2$Statistic.1)
+
+```
+
+#Inter-individual variation (Distances to compositional centroids)
+
+```{r fig.width=15,fig.height=15}
+SD$COMB<-paste(SD$Species,SD$Transect,sep="_")
+BC.beta<-betadisper(as.dist(bc),SD$COMB)
+JA.beta<-betadisper(as.dist(ja),SD$COMB)
+
+SD$BC.beta<-BC.beta$distances
+SD$JA.beta<-JA.beta$distances
+
+######################################
+#AIC - spatial vs. non-spatial models#
+######################################
+
+m_bc.sp <- fitme(BC.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "REML",
+                           control.glm=list(maxit=200))
+
+m_bc.nonsp <- fitme(BC.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = SD, method = "REML",
+                           control.glm=list(maxit=200))
+AIC(m_bc.sp)
+AIC(m_bc.nonsp)
+
+m_ja.sp <- fitme(JA.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "REML",
+                           control.glm=list(maxit=200))
+
+m_ja.nonsp <- fitme(JA.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = SD, method = "REML",
+                           control.glm=list(maxit=200))
+AIC(m_ja.sp)
+AIC(m_ja.nonsp)
+
+#########################################
+#Models selactions Spatial BRAY##########
+#########################################
+
+
+#Full model
+m_bc.1 <- fitme(BC.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#Wihout BW
+m_bc.2 <- fitme(BC.beta ~Gravid_my+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Wihout Gravid_my
+m_bc.3 <- fitme(BC.beta ~Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Wihout Species:Admix
+m_bc.4 <- fitme(BC.beta ~Species+Admix+Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Wihout Admix
+m_bc.5 <- fitme(BC.beta ~Species+Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Wihout Species
+m_bc.6 <- fitme(BC.beta ~Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Wihout Transect
+m_bc.7 <- fitme(BC.beta ~1+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m_bc.1,m_bc.2)$basicLRT
+A2<-anova(m_bc.2,m_bc.3)$basicLRT
+A3<-anova(m_bc.3,m_bc.4)$basicLRT
+A4<-anova(m_bc.4,m_bc.5)$basicLRT
+A5<-anova(m_bc.5,m_bc.6)$basicLRT
+A6<-anova(m_bc.6,m_bc.7)$basicLRT
+
+DF.BC.sp<-data.frame(Predictor=c("BW","Gravid_my","Species x Admix","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.BCsp<-summary(m_bc.1)$beta_table
+
+#########################################
+#Models selections non-spatial BRAY######
+#########################################
+
+#Full model
+m_bc.1 <- fitme(BC.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#Without BW
+m_bc.2 <- fitme(BC.beta ~Gravid_my+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) ,
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Gravid_my
+m_bc.3 <- fitme(BC.beta ~Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species:Admix
+m_bc.4 <- fitme(BC.beta ~Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m_bc.5 <- fitme(BC.beta ~Species+Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species
+m_bc.6 <- fitme(BC.beta ~Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m_bc.7 <- fitme(BC.beta ~1+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m_bc.1,m_bc.2)$basicLRT
+A2<-anova(m_bc.2,m_bc.3)$basicLRT
+A3<-anova(m_bc.3,m_bc.4)$basicLRT
+A4<-anova(m_bc.4,m_bc.5)$basicLRT
+A5<-anova(m_bc.5,m_bc.6)$basicLRT
+A6<-anova(m_bc.6,m_bc.7)$basicLRT
+
+DF.BC.nonsp<-data.frame(Predictor=c("BW","Gravid_my","Species x Admix","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.BCnonsp<-summary(m_bc.1)$beta_table
+
+#########################################
+#Models selections spatial JACCARD#######
+#########################################
+
+#Full model
+m_ja.1 <- fitme(JA.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#Without BW
+m_ja.2 <- fitme(JA.beta ~Gravid_my+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Gravid_my
+m_ja.3 <- fitme(JA.beta ~Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species:Admix
+m_ja.4 <- fitme(JA.beta ~Species+Admix+Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m_ja.5 <- fitme(JA.beta ~Species+Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species
+m_ja.6 <- fitme(JA.beta ~Transect+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m_ja.7 <- fitme(JA.beta ~Species+
+                           (1|Locality_my) + Matern(1 | X_Longit_mean+ Y_Latit_mean),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m_ja.1,m_ja.2)$basicLRT
+A2<-anova(m_ja.2,m_ja.3)$basicLRT
+A3<-anova(m_ja.3,m_ja.4)$basicLRT
+A4<-anova(m_ja.4,m_ja.5)$basicLRT
+A5<-anova(m_ja.5,m_ja.6)$basicLRT
+A6<-anova(m_ja.5,m_ja.7)$basicLRT
+
+DF.JA.sp<-data.frame(Predictor=c("BW","Gravid_my","Species x Admix","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.JAsp<-summary(m_ja.1)$beta_table
+
+
+#########################################
+#Models selections non-spatial JACCARD###
+#########################################
+
+#FUll model
+m_ja.1 <- fitme(JA.beta ~Gravid_my+BW+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#Without BW
+m_ja.2 <- fitme(JA.beta ~Gravid_my+Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Gravid_my
+m_ja.3 <- fitme(JA.beta ~Species+Admix+Transect+
+                           Species:Admix+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species:Admix
+m_ja.4 <- fitme(JA.beta ~Species+Admix+Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Admix
+m_ja.5 <- fitme(JA.beta ~Species+Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Species
+m_ja.6 <- fitme(JA.beta ~Transect+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+
+#Without Transect
+m_ja.7 <- fitme(JA.beta ~Species+
+                           (1|Locality_my),
+                           data = SD, method = "ML",
+                           control.glm=list(maxit=200))
+#LR tests
+A1<-anova(m_ja.1,m_ja.2)$basicLRT
+A2<-anova(m_ja.2,m_ja.3)$basicLRT
+A3<-anova(m_ja.3,m_ja.4)$basicLRT
+A4<-anova(m_ja.4,m_ja.5)$basicLRT
+A5<-anova(m_ja.5,m_ja.6)$basicLRT
+A6<-anova(m_ja.5,m_ja.7)$basicLRT
+
+DF.JA.nonsp<-data.frame(Predictor=c("BW","Gravid_my","Species x Admix","Admix","Species","Transect"),
+                      rbind(A1,A2,A3,A4,A5,A6))
+
+FULL.JAnonsp<-summary(m_ja.1)$beta_table
+
+#######################################
+#Table with model parameters###########
+#######################################
+
+DF.BETA<-data.frame(Dissimilarity=c("Bray-Curtis",rep("",(dim(FULL.BCsp)[1]-1)),
+                                    "Jaccard",rep("",(dim(FULL.BCsp)[1]-1))),
+                    Predictor=c(rownames(FULL.BCsp),rownames(FULL.BCnonsp)),
+                     rbind(cbind(FULL.BCsp,FULL.BCnonsp),
+                           cbind(FULL.JAsp,FULL.JAnonsp)))
+
+DF.BETA.0<-DF.BETA  
+DF.BETA.0<-DF.BETA.0[-grep("Interc",DF.BETA.0$Predictor),]
+t.test(DF.BETA.0$Estimate,DF.BETA.0$Estimate.1,paired = T)
+t.test(DF.BETA.0$Cond..SE,DF.BETA.0$Cond..SE.1,paired = T)
+
+write.table(DF.BETA,
+            file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/Betadisper_estimates.txt",
+            sep="\t",quote = F,row.names = F)
+
+#####################################
+#Table - model selection process#####
+#####################################
+
+
+DF.LR<-data.frame(Dissimilarity=c("Bray-Curtis",rep("",(dim(DF.BC.sp)[1]-1)),
+                                    "Jaccard",rep("",(dim(DF.BC.sp)[1]-1))),
+                    rbind(cbind(DF.BC.sp,DF.BC.nonsp[,-1]),
+                           cbind(DF.JA.sp,DF.JA.nonsp[,-1])))
+
+write.table(DF.LR,
+            file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/Betadisper_LR.txt",
+            sep="\t",quote = F,row.names = F)
+
+```
+
+
+
+# Barplots - taxonomy (Genus level)
+
+```{r fig.width=15}
+####################
+#Genus level########
+####################
+
+MERGED_class<-tax_glom(PHYLOSEQ_16S_HZ_final.1000.trans, taxrank="Genus",NArm=FALSE)
+MERGED_class<-manage_unassigned(MERGED_class,UNASS_STRING=NA,ADD="",AFTER=TRUE)
+phylum.prop = tapply(taxa_sums(PHYLOSEQ_16S_HZ_final.1000.trans), tax_table(PHYLOSEQ_16S_HZ_final.1000.trans)[, "Genus"], sum, na.rm = TRUE)/dim(otu_table(PHYLOSEQ_16S_HZ_final.1000.trans))[1]
+sort(phylum.prop, TRUE)[1:15]
+
+top8phyla = names(sort(phylum.prop, TRUE))[1:20]
+
+TAXO<-as.character(tax_table(MERGED_class)[,6])
+TAXO[TAXO == "?" ] <- "unassigned"
+TAXO[!TAXO %in% c(top8phyla,"unassigned")] <- "others"
+
+tax_table(MERGED_class)[,6]<-TAXO
+
+mdf = psmelt(MERGED_class)
+
+top8phyla.c<-top8phyla
+top8phyla.c[is.na(top8phyla.c)]<-"unassigned"
+
+mdf$Genus-factor(mdf$Genus,levels=c(top8phyla.c,"others"))
+
+# mdf$category<-factor(mdf$category,levels=c("K","1","2"))
+# levels(mdf$category)<-c("C","1","2")
+library(ggnomics)
+library(ggh4x)
+
+mdf$Admix.category<-cut(mdf$Admix,breaks=c(-Inf,0.15, Inf), labels=c("<0.15",">0.15"))
+mdf$Genus<-gsub(" group","",mdf$Genus)
+mdf$Genus<-gsub(" gut","",mdf$Genus)
+mdf$Genus<-as.factor(mdf$Genus)
+LEVELS<-levels(mdf$Genus)
+LEVELS2<-LEVELS[LEVELS!="others"]
+mdf$Genus<-factor(mdf$Genus,levels = c(LEVELS2,"others"))
+
+p = ggplot(mdf, aes_string(x = "Sample", y = "Abundance", fill = "Genus",order="Genus"))+theme_bw()
+p = p + geom_bar(stat = "identity", position = "stack")
+p = p + theme(axis.text.x = element_text(angle = -90, hjust = 0,size=5),axis.text.y = element_text(hjust = 0,size=5),axis.title.x = element_text(size=0))
+p <- p + facet_nested(~Transect+Species+Admix.category , scales = "free",space = "free",nest_line = F)+theme(strip.text = element_text(size = 8, angle = 0)) +
+  scale_fill_manual(values = c(c25[1:20],"gray"))
+p_class_samples<-p
+p_class_samples
+
+p_class_samples<-p_class_samples+theme(legend.title = element_blank(),
+                      legend.position = "bottom",
+                      legend.text = element_text(size=8),
+                      axis.text.x = element_blank(),
+                      legend.key.size = unit(0.5, 'cm'))
+
+ggsave(p_class_samples,filename = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/genus_tax.pdf",width = 18,height = 10,units = "cm")
+
+p_genus_samples<-p_class_samples
+save(p_genus_samples,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/p_genus_samples.R")
+
+```
+
+# Barplots - taxonomy (Class level)
+
+```{r fig.width=15}
+####################
+#Class level########
+####################
+
+MERGED_class<-tax_glom(PHYLOSEQ_16S_HZ_final.1000.trans, taxrank="Class",NArm=FALSE)
+MERGED_class<-manage_unassigned(MERGED_class,UNASS_STRING=NA,ADD="",AFTER=TRUE)
+phylum.prop = tapply(taxa_sums(PHYLOSEQ_16S_HZ_final.1000.trans), tax_table(PHYLOSEQ_16S_HZ_final.1000.trans)[, "Class"], sum, na.rm = TRUE)/dim(otu_table(PHYLOSEQ_16S_HZ_final.1000.trans))[1]
+sort(phylum.prop, TRUE)[1:15]
+
+top8phyla = names(sort(phylum.prop, TRUE))[1:20]
+
+TAXO<-as.character(tax_table(MERGED_class)[,3])
+TAXO[TAXO == "?" ] <- "unassigned"
+TAXO[!TAXO %in% c(top8phyla,"unassigned")] <- "others"
+
+tax_table(MERGED_class)[,3]<-TAXO
+
+mdf = psmelt(MERGED_class)
+
+top8phyla.c<-top8phyla
+top8phyla.c[is.na(top8phyla.c)]<-"unassigned"
+
+mdf$Genus-factor(mdf$Genus,levels=c(top8phyla.c,"others"))
+
+# mdf$category<-factor(mdf$category,levels=c("K","1","2"))
+# levels(mdf$category)<-c("C","1","2")
+library(ggnomics)
+library(ggh4x)
+
+mdf$Admix.category<-cut(mdf$Admix,breaks=c(-Inf,0.1, Inf), labels=c("<0.1",">0.1"))
+
+p = ggplot(mdf, aes_string(x = "Sample", y = "Abundance", fill = "Class",order="Class"))+theme_bw()
+p = p + geom_bar(stat = "identity", position = "stack")
+p = p + theme(axis.text.x = element_text(angle = -90, hjust = 0,size=5),axis.text.y = element_text(hjust = 0,size=5),axis.title.x = element_text(size=0))
+p <- p + facet_nested(~Transect+Species+Admix.category , scales = "free",space = "free",nest_line = F)+theme(strip.text = element_text(size = 8, angle = 0)) +
+  scale_fill_manual(values = c25)
+p_class_samples<-p
+p_class_samples
+
+p_class_samples<-p_class_samples+theme(legend.title = element_blank(),
+                      legend.position = "bottom",
+                      legend.text = element_text(size=8),
+                      axis.text.x = element_blank(),
+                      legend.key.size = unit(0.5, 'cm'))
+
+ggsave(p_class_samples,filename = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/class_tax.pdf",width = 18,height = 10,units = "cm")
+
+save(p_class_samples,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/PLOTS_TABLES/p_class_samples.R")
+```
+
+# HMSC models
+
+## Model with spatial autocorrelation 
+
+```{r}
+
+#Selecting AVSs (prevalence > 0.1)
+
+PHYLOSEQ_16S_HZ_final.1000.sub<-PHYLOSEQ_16S_HZ_final.1000
+
+PHYLOSEQ_16S_HZ_final.1000.sub_01<-transform_sample_counts(PHYLOSEQ_16S_HZ_final.1000.sub,function(x) ifelse(x>0,1,0))
+PREVAL<-taxa_sums(PHYLOSEQ_16S_HZ_final.1000.sub_01)/nsamples(PHYLOSEQ_16S_HZ_final.1000.sub_01)
+#PREVAL
+sum(PREVAL>0.1)
+
+PREVAL.otus<-names(PREVAL)[PREVAL>0.1]
+PHYLOSEQ_16S_HZ_final.1000.sub_filtered<-prune_taxa(taxa_names(PHYLOSEQ_16S_HZ_final.1000.sub)%in%PREVAL.otus,PHYLOSEQ_16S_HZ_final.1000.sub)
+
+OTU_T<-otu_table(PHYLOSEQ_16S_HZ_final.1000.sub_filtered)
+
+
+PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare<-rarefy_even_depth(PHYLOSEQ_16S_HZ_final.1000.sub_filtered)
+PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare<-prune_taxa(taxa_names(PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare)%in%taxa_names(OTU_T),PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare)
+OTU_T.r<-otu_table(PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare)
+
+#preparing data.frame with explanatory variables
+VARIABLES<-c("Gravid_my","BW","Species","Admix")
+SD<-data.frame(sample_data(PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare))
+SD$SSUMS<-sample_sums(PHYLOSEQ_16S_HZ_final.1000.sub_filtered.rare)
+
+MEAN_latid<-tapply(SD$Y_Latit_mean,SD$Transect,mean)
+MEAN_longit<-tapply(SD$X_Longit_mean,SD$Transect,mean)
+
+SD$Y_Latit_mean_centered<-ifelse(SD$Transect=="HZ_REG",SD$Y_Latit_mean-MEAN_latid[2],SD$Y_Latit_mean-MEAN_latid[1])
+SD$X_Longit_mean_centered<-ifelse(SD$Transect=="HZ_REG",SD$X_Longit_mean-MEAN_longit[2],SD$X_Longit_mean-MEAN_longit[1])
+
+SD$pos <- numFactor(SD$X_Longit_mean_centered, SD$Y_Latit_mean_centered)
+
+SD$BW.s<-scale(SD$BW)
+SD$Admix.s<-scale(SD$Admix)
+
+
+RELEVANT_VARS<-c("Gravid_my","BW.s","Species","Admix.s","Locality_my","SSUMS",
+                 "X_Longit_mean_centered", "Y_Latit_mean_centered","Transect") 
+SAMPLE.D<-SD
+SAMPLE.D<-SAMPLE.D[,names(SAMPLE.D)%in%RELEVANT_VARS]
+
+summary(SAMPLE.D)
+
+#spatial coordiantes
+xycoords<-as.matrix(SAMPLE.D)[,names(SAMPLE.D)%in%c("X_Longit_mean_centered", "Y_Latit_mean_centered")]
+xycoords<-apply(xycoords,2,function(x) as.numeric(x))
+xycoords<-xycoords[!duplicated(SAMPLE.D$Locality_my),]
+rownames(xycoords)<-SAMPLE.D$Locality_my[duplicated(SAMPLE.D$Locality_my)==F]
+
+#study design
+studyDesign = data.frame(sample = as.factor(SAMPLE.D$Locality_my))
+studyDesign$group<-as.factor(SAMPLE.D$Locality_my)
+studyDesign$individual<-as.factor(as.factor(1:dim(SAMPLE.D)[1]))
+rownames(studyDesign)<-studyDesign$individual
+
+#random effects
+rL.group = HmscRandomLevel(units = levels(studyDesign$group))
+rL.indiv = HmscRandomLevel(units = levels(studyDesign$individual))
+rL.spatial = HmscRandomLevel(sData = xycoords)
+rL.spatial = setPriors(rL.spatial,nfMin=1,nfMax=1)
+
+class(OTU_T.r)<-"matrix"
+rownames(OTU_T.r)<-rownames(studyDesign)
+
+
+
+####################################
+#HURDLE MODEL#######################
+####################################
+
+OTU_T.r.prev<-OTU_T.r
+OTU_T.r.abu<-OTU_T.r
+
+OTU_T.r.prev[OTU_T.r.prev>0]<-1
+OTU_T.r.abu[OTU_T.r.abu==0]<-NA
+
+
+#A) Read counts + lognormal poisson distrib 
+m = Hmsc(Y = OTU_T.r.abu, XData = SAMPLE.D, 
+         XFormula = ~Gravid_my+BW.s+Species+Admix.s+Transect+
+           Admix.s:Species,
+         studyDesign = studyDesign, 
+         ranLevels = list("sample" = rL.spatial,"group"=rL.group,"individual"=rL.indiv),
+         distr="lognormal poisson")
+
+BOTHTRANSECTS_16S.hurdleAbu<-m
+
+# Sys.time()
+# m = sampleMcmc(BOTHTRANSECTS_16S.hurdleAbu, thin = 1, samples = 1000, transient = 1,
+#                nChains = 1, nParallel = 1, verbose =F,updater=list(GammaEta=FALSE))
+# Sys.time()
+
+HMSC_OBJ<-BOTHTRANSECTS_16S.hurdleAbu
+save(HMSC_OBJ,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/Hmsc_models/BOTHTRANSECTS_16S.hurdleAbu.R")
+
+#B) ASV presence/absence + probit link 
+
+m = Hmsc(Y = OTU_T.r.prev, XData = SAMPLE.D, 
+         XFormula = ~Gravid_my+BW.s+Species+Admix.s+Transect+
+           Admix.s:Species,
+         studyDesign = studyDesign, 
+         ranLevels = list("sample" = rL.spatial,"group"=rL.group,"individual"=rL.indiv),
+         distr="probit")
+
+BOTHTRANSECTS_16S.hurdlePrev<-m
+
+
+# Sys.time()
+# m = sampleMcmc(BOTHTRANSECTS_16S.hurdlePrev, thin = 1, samples = 1000, transient = 1,
+#                nChains = 1, nParallel = 1, verbose =F,updater=list(GammaEta=FALSE))
+# Sys.time()
+
+HMSC_OBJ<-BOTHTRANSECTS_16S.hurdlePrev
+save(HMSC_OBJ,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/Hmsc_models/BOTHTRANSECTS_16S.hurdlePrev.R")
+
+
+```
+
+## Model without spatial autocorrelation 
+
+```{r eval=FALSE, fig.width=15, include=FALSE}
+
+####################################
+#HURDLE MODEL#######################
+####################################
+
+OTU_T.r.prev<-OTU_T.r
+OTU_T.r.abu<-OTU_T.r
+
+OTU_T.r.prev[OTU_T.r.prev>0]<-1
+OTU_T.r.abu[OTU_T.r.abu==0]<-NA
+
+#A) Read counts + lognormal poisson distrib 
+m = Hmsc(Y = OTU_T.r.abu, XData = SAMPLE.D, 
+         XFormula = ~Gravid_my+BW.s+Species+Admix.s+Transect+
+           Admix.s:Species,
+         studyDesign = studyDesign, 
+         ranLevels = list("group"=rL.group,"individual"=rL.indiv),
+         distr="lognormal poisson")
+
+BOTHTRANSECTS_16SNOsp.hurdleAbu<-m
+
+
+# Sys.time()
+# m = sampleMcmc(BOTHTRANSECTS_16SNOsp.hurdleAbu, thin = 1, samples = 1000, transient = 1,
+#                nChains = 1, nParallel = 1, verbose =F,updater=list(GammaEta=FALSE))
+# Sys.time()
+
+HMSC_OBJ<-BOTHTRANSECTS_16SNOsp.hurdleAbu
+save(HMSC_OBJ,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/Hmsc_models/BOTHTRANSECTS_16SNOsp.hurdleAbu.R")
+
+#B) ASV presence/absence + probit link 
+m = Hmsc(Y = OTU_T.r.prev, XData = SAMPLE.D, 
+         XFormula = ~Gravid_my+BW.s+Species+Admix.s+Transect+
+           Admix.s:Species,
+         studyDesign = studyDesign, 
+         ranLevels = list("group"=rL.group,"individual"=rL.indiv),
+         distr="probit")
+
+BOTHTRANSECTS_16SNOsp.hurdlePrev<-m
+
+Sys.time()
+m = sampleMcmc(BOTHTRANSECTS_16SNOsp.hurdlePrev, thin = 1, samples = 1000, transient = 1,
+               nChains = 1, nParallel = 1, verbose =F,updater=list(GammaEta=FALSE))
+Sys.time()
+
+HMSC_OBJ<-BOTHTRANSECTS_16SNOsp.hurdlePrev
+save(HMSC_OBJ,file = "/media/kreising/DATA/data/HM_hybrid_zone_all/Hmsc_models/BOTHTRANSECTS_16SNOsp.hurdlePrev.R")
+
+```
